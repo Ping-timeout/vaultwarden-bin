@@ -1,0 +1,178 @@
+name: Extract and Release Vaultwarden Binaries
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs every 8 hours
+    - cron: '0 */8 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  ## 1. CHECK VERSION & STATE
+  ## ---------------------------------------------
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.get_version.outputs.RELEASE_VERSION }}
+      release_id: ${{ steps.get_info.outputs.RELEASE_ID }}
+      release_exists: ${{ steps.get_info.outputs.EXISTS }}
+      # Expose simple list of architectures for downstream jobs
+      arch_list: ${{ steps.set_arch.outputs.ARCH_LIST }}
+      # Expose full matrix for the extract-binaries job
+      full_matrix: ${{ steps.set_arch.outputs.FULL_MATRIX }}
+    steps:
+      - name: Get latest upstream version
+        id: get_version
+        # Use set -eo pipefail for immediate error detection
+        run: |
+          set -eo pipefail
+          # Use fewer steps to get version to avoid rate-limiting on larger data fetches
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r .tag_name)
+          echo "RELEASE_VERSION=${LATEST_RELEASE}" >> $GITHUB_OUTPUT
+          echo "Vaultwarden Version: $LATEST_RELEASE"
+
+      - name: Set Architecture Matrix Outputs
+        id: set_arch
+        # Define static matrix structure here
+        run: |
+          # Define the arches and platforms used in the extraction job
+          FULL_MATRIX='[{"arch":"amd64", "platform":"linux/amd64"}, {"arch":"arm64", "platform":"linux/arm64"}, {"arch":"armv7", "platform":"linux/arm/v7"}, {"arch":"armv6", "platform":"linux/arm/v6"}]'
+          # Define a simpler list for the release-management job matrix
+          ARCH_LIST='["amd64", "arm64", "armv7", "armv6"]'
+          
+          echo "FULL_MATRIX=$FULL_MATRIX" >> $GITHUB_OUTPUT
+          echo "ARCH_LIST=$ARCH_LIST" >> $GITHUB_OUTPUT
+
+      - name: Check for existing release
+        id: get_info
+        env:
+          # Use -f flag on curl for better error handling (Improvement 4 implied via set -e)
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+          TAG: "${{ steps.get_version.outputs.RELEASE_VERSION }}"
+        run: |
+          set -eo pipefail
+          # Check if our extracted release already exists in THIS repo
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Release exists."
+            echo "EXISTS=true" >> $GITHUB_OUTPUT
+            # Fetch ID for later use
+            ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" | jq -r .id)
+            echo "RELEASE_ID=$ID" >> $GITHUB_OUTPUT
+          else
+            echo "Release does not exist."
+            echo "EXISTS=false" >> $GITHUB_OUTPUT
+            echo "RELEASE_ID=" >> $GITHUB_OUTPUT
+          fi
+
+  ## 2. EXTRACT BINARIES
+  ## ---------------------------------------------
+  extract-binaries:
+    needs: check-version
+    runs-on: ubuntu-latest
+    # ONLY RUN if the release is NEW
+    if: needs.check-version.outputs.release_exists == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Use the combined matrix output from the check-version job
+        include: ${{ fromJson(needs.check-version.outputs.full_matrix) }}
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y wget unzip jq
+
+      - name: Download extraction script
+        run: |
+          set -eo pipefail
+          # Pinned to a specific commit for security/stability
+          curl -sSL -o docker-image-extract https://github.com/jjlin/docker-image-extract/raw/4273b2796da5055e431b4db5efe29a71bba12b45/docker-image-extract
+          chmod +x docker-image-extract
+
+      - name: Extract Binaries
+        run: |
+          set -eo pipefail
+          # USE THE SPECIFIC VERSION TAG, NOT LATEST
+          VERSION_TAG="${{ needs.check-version.outputs.release_version }}-alpine"
+          ARCH="${{ matrix.arch }}"
+          PLATFORM="${{ matrix.platform }}"
+          ZIP_NAME="vaultwarden-linux-${ARCH}.zip"
+
+          echo "Extracting version: $VERSION_TAG for $PLATFORM"
+
+          ./docker-image-extract -p "$PLATFORM" vaultwarden/server:"$VERSION_TAG"
+
+          # Prepare directory for zipping
+          mkdir -p build
+          mv output/vaultwarden build/
+          mv output/web-vault build/
+
+          # Zip it up
+          cd build
+          zip -r ../"$ZIP_NAME" vaultwarden web-vault
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-linux-${{ matrix.arch }}
+          path: vaultwarden-linux-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  ## 3. RELEASE & UPLOAD (PARALLELIZED & SIMPLIFIED)
+  ## ---------------------------------------------
+  release-management:
+    needs: [check-version, extract-binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        # Use the simpler list of architectures
+        arch: ${{ fromJson(needs.check-version.outputs.arch_list) }}
+    steps:
+      - name: Create Release (if new)
+        # This step only runs if a new release needs to be created.
+        id: create_release
+        if: needs.check-version.outputs.release_exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
+          tag_name: ${{ needs.check-version.outputs.release_version }}
+          name: ${{ needs.check-version.outputs.release_version }}
+          body: |
+            This release contains extracted binaries from the Vaultwarden Docker images for multiple Linux architectures.
+
+            Original release: https://github.com/dani-garcia/vaultwarden/releases/tag/${{ needs.check-version.outputs.release_version }}
+          draft: false
+          prerelease: false
+
+      - name: Download Single Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vaultwarden-linux-${{ matrix.arch }}
+          path: assets
+
+      - name: Upload Asset to Release (New or Existing)
+        # Reuse softprops/action-gh-release for asset upload/overwrite.
+        uses: softprops/action-gh-release@v2
+        env:
+          # Determine which Release ID to use (New or Existing)
+          # Note: We must use the 'tag_name' here, as asset upload requires it.
+          # The action will upload to the existing tag if it exists, or the one
+          # created in the 'create_release' step.
+          TAG_NAME: ${{ needs.check-version.outputs.release_version }}
+        with:
+          # Set tag_name so the action knows which release to attach to
+          tag_name: ${{ env.TAG_NAME }}
+          token: ${{ secrets.RELEASE_PAT }}
+          # The action will upload this asset and overwrite it if it exists.
+          files: assets/vaultwarden-linux-${{ matrix.arch }}.zip
+          # No name/body needed for asset-only upload
+          body: ''
+          name: ''
+          # Do not create a new release here; only upload to the determined tag.
+          # We rely on 'create_release' to handle new releases.
+          target_commitish: '' 
+          draft: false
+          prerelease: false
